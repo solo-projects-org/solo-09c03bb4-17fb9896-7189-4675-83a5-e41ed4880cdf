@@ -13,6 +13,9 @@
   T10 幂等上传令牌重放
   T11 轮换中途重启 API：作业自动接续到完成
   T12 篡改密文 -> GCM 验签失败
+  T13-T21 卷迁移（tests/test_migration.py）：逐字节搬运、在途/新发下载完整、
+      轮换交错不回写旧信封、复制失败旧卷供数、同号重试安全、重启接续、
+      清理失败重试、其他原片不受影响
 """
 from __future__ import annotations
 
@@ -96,8 +99,10 @@ class Service:
 def stack(tmp_path):
     key_db = tmp_path / "keys"
     api_data = tmp_path / "api"
+    api_next = tmp_path / "api-next"      # 模拟 Compose 挂载的新密文卷
     key_db.mkdir()
     api_data.mkdir()
+    api_next.mkdir()
     kport, aport = _free_port(), _free_port()
 
     key_svc = Service("keystore", KEY_DIR, kport, {
@@ -109,6 +114,7 @@ def stack(tmp_path):
     api_svc = Service("api", API_DIR, aport, {
         "METADATA_DB": str(api_data / "metadata.db"),
         "BLOB_DIR": str(api_data / "blobs"),
+        "MIGRATION_TARGET_DIR": str(api_next / "blobs"),
         "KEY_SERVICE_URL": f"http://127.0.0.1:{kport}",
         "KEY_SERVICE_TOKEN": TOKEN,
         "UPLOAD_STALE_SECONDS": "2",
@@ -121,6 +127,8 @@ def stack(tmp_path):
         "api": api_svc, "keys": key_svc, "client": client,
         "key_client": key_client, "data_dir": api_data,
         "blob_dir": api_data / "blobs",
+        "new_blob_dir": api_next / "blobs",
+        "next_dir": api_next,
     }
     client.close()
     key_client.close()
@@ -140,6 +148,16 @@ def _wait_rotation(client: httpx.Client, job_id: str, timeout: float = 60.0) -> 
             return job
         time.sleep(0.25)
     raise AssertionError("rotation did not finish")
+
+
+def _wait_migration(client: httpx.Client, job_id: str, timeout: float = 60.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = client.get(f"/migrations/{job_id}").json()
+        if job["state"] in ("completed", "failed"):
+            return job
+        time.sleep(0.25)
+    raise AssertionError(f"migration did not finish: {job}")
 
 
 def _upload(client: httpx.Client, data: bytes, image_id: str | None = None,

@@ -3,7 +3,9 @@
 显微仪器原片（raw image）的接收、流式加密存储与按号读取。每件原片使用
 **独立数据密钥（DEK）**，DEK 由独立持久化的**密钥服务**用主密钥（MK）以
 AES-256-GCM 信封包裹；支持主密钥在线轮换：只迁移密钥信封、**不重写图像正文**，
-迁移核实完成后再销毁旧主密钥。
+迁移核实完成后再销毁旧主密钥。支持**密文存储卷在线更换**：按编号把已发布
+原片的密文搬到 Compose 挂载的新卷，逐字节核对后切换元数据并清理旧卷，
+全程不解密、不改写原片与信封，原编号取数不中断。
 
 ## 架构
 
@@ -16,11 +18,12 @@ AES-256-GCM 信封包裹；支持主密钥在线轮换：只迁移密钥信封�
 │  - 原片流式分帧加解密（内存）   │     generate/unwrap/rewrap     │  - 主密钥生命周期          │
 │  - SQLite 元数据（只存密文信封）│     rotate/destroy/status      │  - DEK 包裹/解包/改包       │
 │  - 轮换作业状态机 + 后台线程    │                                 │  - SQLite 持久卷（MK 本体） │
-│  - blob：密文原片 .msef        │                                  └──────────────────────────┘
+│  - 卷迁移作业状态机 + 后台线程  │                                 └──────────────────────────┘
+│  - blob：密文原片 .msef        │                                            │
 └──────────────┬───────────────┘                                            │
-               │ 卷 api-data                    卷 keystore-data ◀──────────┘
+               │ 卷 api-data（当前）+ 卷 api-data-next（迁移目标）  卷 keystore-data ◀┘
         /data/metadata.db
-        /data/blobs/*.msef（密文）
+        /data/blobs/*.msef（密文）  →迁移→  /data-next/blobs/*.msef（密文）
 ```
 
 **安全边界**
@@ -59,6 +62,9 @@ docker compose up --build
 | `POST /rotations` | 发起主密钥轮换（body `{"confirm": true}`），返回 202 + job_id |
 | `GET /rotations/{job_id}` | 轮换进度（state/migrated/failed/progress_percent） |
 | `GET /rotations/latest` | 最近一次轮换 |
+| `POST /migrations` | 发起卷迁移（`image_ids` 缺省为全部 ready；`target_dir` 缺省为 `MIGRATION_TARGET_DIR`），返回 202 + job_id |
+| `GET /migrations/{job_id}` | 迁移进度（state/migrated/failed/failed_items/progress_percent） |
+| `GET /migrations/latest` | 最近一次迁移 |
 | `GET /keys/status` | 代理密钥服务只读状态 |
 
 上传请使用原始 `application/octet-stream`（`curl --data-binary @file`），
@@ -79,6 +85,11 @@ sha256sum slide_001.czi /tmp/slide_001.czi
 JOB=$(curl -sS -X POST -H 'Content-Type: application/json' \
   -d '{"confirm":true}' http://localhost:8000/rotations | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
 watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
+
+# 更换密文卷：按编号迁移（image_ids 缺省时迁移全部 ready 原片）
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"confirm":true,"image_ids":["slide-001"]}' http://localhost:8000/migrations
+watch -n1 "curl -sS http://localhost:8000/migrations/latest"
 ```
 
 ## 轮换语义（需求对照）
@@ -100,6 +111,30 @@ watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 8. **进程重启接续**：轮换作业状态在 SQLite；API 重启后自动驱动未完成作业到
    终态；若崩溃发生在“MK 已切换、作业未建”窗口，启动时自动对账补建作业。
 
+## 卷迁移语义（更换密文存储卷）
+
+1. `POST /migrations` 按编号迁移 `ready` 原片（`image_ids` 缺省 = 全部 ready；
+   `target_dir` 缺省 = 环境变量 `MIGRATION_TARGET_DIR`，即 Compose 挂载的新卷）。
+   同一时刻只允许一个迁移作业，进行中再次发起返回 `409 migration_in_progress`。
+2. 每件原片的状态机：`copying`（流式复制到新卷临时文件，**逐字节核对**一致后
+   原子 rename）→ `copied`（条件 UPDATE 切换元数据 `blob_path`，**只改路径列**）
+   → `switched`（等在途下载归零后删除旧卷文件）→ `done`。
+   **全程不解密、不改写原片正文与信封**（信封列从不经手）。
+3. **取数不中断**：下载在读取元数据前登记，迁移切换路径后会等该原片的在途
+   下载全部结束才删旧文件；切换后新发起的下载直接从新卷取数。
+4. **与轮换并存**：轮换的 rewrap 只条件更新信封列，迁移只条件更新路径列，
+   互不覆盖——迁移绝不可能把旧信封写回。
+5. **复制失败**：条目判失败、元数据不动，**旧卷继续供数**；作业整体报
+   `failed` 并列出 `failed_items`，修复后同号重试即可。
+6. **清理失败/进程重启**：清理持续重试（旧卷恢复可写后自动接续）；作业与
+   条目状态持久化，API 重启后自动从 `copying/copied/switched` 任一阶段接续。
+   **只有新卷可取数且旧件已清除，作业才报 `completed`。**
+7. **同号重试安全**：元数据已指向新卷时跳过复制；清理的不变式是
+   “绝不删除元数据当前指向的有效副本”。
+8. 迁移只动清单内的原片：其他原片照常入仓（仍写当前卷 `BLOB_DIR`）与下载。
+   迁移完成后如需让新入仓也写新卷，把 `BLOB_DIR` 指到新卷挂载点即可
+   （元数据按件记录绝对路径，历史件不受影响），详见 docs/OPERATIONS.md。
+
 ## 故障注入（演练用，密钥服务环境变量）
 
 | 变量 | 作用 |
@@ -114,7 +149,7 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（32 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
@@ -123,7 +158,10 @@ python -m pytest tests/ -q
 篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
-跨越轮换的上传自动改绑。
+跨越轮换的上传自动改绑；卷迁移：逐字节搬运与旧卷清理、缺省全量与请求校验、
+迁移中在途/新发下载完整、迁移×轮换交错（信封不回写）、复制失败旧卷供数、
+同号重试幂等与双卷摆荡、API 重启接续（copying/switched 中途态）、
+清理失败重试至成功、迁移期间其他原片入仓下载不受影响。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 

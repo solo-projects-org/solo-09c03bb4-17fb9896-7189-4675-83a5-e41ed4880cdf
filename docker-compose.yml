@@ -32,14 +32,19 @@ services:
       KEY_SERVICE_TOKEN: "${KEY_SERVICE_TOKEN:-change-me-please-32bytes-token}"
       METADATA_DB: "/data/metadata.db"
       BLOB_DIR: "/data/blobs"
+      # 卷迁移缺省目标：新密文卷挂载点（POST /migrations 的缺省 target_dir）
+      MIGRATION_TARGET_DIR: "${MIGRATION_TARGET_DIR:-/data-next/blobs}"
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-21474836480}"
       # 僵死在途上传超时（秒），超时判失败以保证轮换可推进
       UPLOAD_STALE_SECONDS: "${UPLOAD_STALE_SECONDS:-3600}"
     volumes:
       - api-data:/data
+      # 新密文存储卷（更换存储卷时的迁移目标；迁移完成后可按 OPERATIONS.md 下线旧卷）
+      - api-data-next:/data-next
     ports:
       - "8000:8000"
 
 volumes:
   keystore-data:
   api-data:
+  api-data-next:

@@ -4,7 +4,7 @@
 
 | 组件 | 镜像 | 持久卷 | 暴露 |
 |---|---|---|---|
-| image-api | microscopy/image-api:1.0.0 | api-data（metadata.db + blobs/） | 8000 |
+| image-api | microscopy/image-api:1.0.0 | api-data（metadata.db + blobs/）、api-data-next（迁移目标新卷） | 8000 |
 | keystore | microscopy/keystore:1.0.0 | keystore-data（keystore.db） | 127.0.0.1:8001 |
 
 两个容器必须配置相同的 `KEY_SERVICE_TOKEN`。密钥服务端口只绑回环地址，
@@ -35,6 +35,37 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 进行中再次发起轮换返回 409。作业失败时先查 `error` 字段，修复后
 （通常是密钥服务暂时不可达）重启 API 即可自动接续，无需手工干预。
 
+## 3.5 更换密文存储卷（在线迁移）
+
+适用场景：旧卷容量/介质到期，需要把已发布原片的密文搬到新卷，
+分析程序仍按原编号取数。全程在线，无需停写停读。
+
+1. 把新卷挂进 API 容器（compose 已预置 `api-data-next:/data-next`，
+   缺省目标 `MIGRATION_TARGET_DIR=/data-next/blobs`；换别的挂载点时
+   同步修改该变量或在请求里显式给 `target_dir`）。
+2. 发起迁移（按编号；`image_ids` 缺省为全部 `ready` 原片）：
+
+   ```bash
+   curl -X POST -H 'Content-Type: application/json' \
+     -d '{"confirm":true}' http://localhost:8000/migrations
+   # 轮询 GET /migrations/{job_id}，state 终态：completed / failed
+   ```
+
+3. 逐件流程：复制到新卷临时文件 → 逐字节核对 → 原子 rename →
+   切换元数据 `blob_path` → 等在途下载结束 → 删除旧卷文件。
+   复制失败不影响取数（旧卷继续供数），作业报 `failed` 并给出
+   `failed_items`；修复目标卷后**同号重发**即可（已迁完的自动跳过，
+   不会删除当前有效副本）。
+4. 清理阶段失败（如旧卷被挂成只读）时作业保持 `running` 并持续重试，
+   `error` 字段可见原因；旧卷恢复可写后自动完成。API 重启不丢进度。
+5. 作业 `completed` 的判定：全部条目新卷可取数且旧件已清除。
+   之后如需新入仓也写新卷，把 `BLOB_DIR` 改为新卷挂载点并重启 API
+   （元数据按件存绝对路径，历史件不受影响）；确认旧卷无引用后
+   （`sqlite3 /data/metadata.db "SELECT count(*) FROM images WHERE blob_path LIKE '/data/blobs/%'"` 为 0）方可从 compose 移除旧卷。
+
+注意：迁移与主密钥轮换可以同时进行，互不影响（一个只改路径列，
+一个只改信封列）；但同一时刻只允许一个迁移作业。
+
 ## 4. 故障演练开关（keystore）
 
 - `KEY_OP_DELAY=<秒>`：模拟慢密钥服务，验证在线流量不被轮换拖死。
@@ -47,6 +78,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 |---|---|
 | API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布）；blob 残片可按 failed 行清理 |
 | API 在轮换中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
+| API 在卷迁移中崩溃 | 重启后按条目状态接续：copying 重复制（先清临时文件）、copied 重新核对后切换、switched 补清理 |
 | 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
 | 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |

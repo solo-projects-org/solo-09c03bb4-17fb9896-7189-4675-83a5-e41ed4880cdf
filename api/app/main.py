@@ -23,6 +23,8 @@ DB_PATH = os.environ.get("METADATA_DB", "/data/metadata.db")
 KEY_SERVICE_URL = os.environ.get("KEY_SERVICE_URL", "http://keystore:8001")
 KEY_SERVICE_TOKEN = os.environ.get("KEY_SERVICE_TOKEN", "dev-only-key-service-token")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(20 * 1024 ** 3)))
+# 卷迁移缺省目标：Compose 挂载的新密文卷（请求体 target_dir 可覆盖）
+MIGRATION_TARGET_DIR = os.environ.get("MIGRATION_TARGET_DIR")
 
 # 安全约束：Starlette 的 multipart 解析器默认把 >1MiB 的表单文件假脱机到
 # 磁盘临时文件，等于让明文原片落盘。将假脱机阈值提高到上传上限，使允许范围
@@ -34,11 +36,14 @@ MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
 from .keyclient import KeyClient, KeyServiceError
 from .metadata import MetadataDB
+from .migration import DownloadTracker, MigrationWorker
 from .rotation import RotationWorker
 
 db = MetadataDB(DB_PATH)
 keys = KeyClient(KEY_SERVICE_URL, KEY_SERVICE_TOKEN)
+dl_tracker = DownloadTracker()
 worker: RotationWorker | None = None
+migration_worker: MigrationWorker | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
 
 
@@ -47,7 +52,7 @@ main_loop: asyncio.AbstractEventLoop | None = None
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker, main_loop
+    global worker, migration_worker, main_loop
     os.makedirs(BLOB_DIR, exist_ok=True)
     main_loop = asyncio.get_running_loop()
     # 等待密钥服务就绪并确保存在当前主密钥（重启幂等）
@@ -78,16 +83,21 @@ async def lifespan(app: FastAPI):
         print(f"[startup] rotation reconciliation skipped: {exc}")
     worker = RotationWorker(db, keys, main_loop)
     worker.start()
+    # 卷迁移线程：接续上次未完成的迁移作业（复制/切换/清理各阶段均可续）
+    migration_worker = MigrationWorker(db, dl_tracker, main_loop)
+    migration_worker.start()
     yield
     worker.stop()
+    migration_worker.stop()
     await keys.aclose()
     db.close()
 
 
 app = FastAPI(
     title="Microscopy Image Warehouse API",
-    version="1.0.0",
-    description="原片流式加密存取，每件独立 DEK；支持主密钥在线轮换与进度查询。",
+    version="1.1.0",
+    description="原片流式加密存取，每件独立 DEK；支持主密钥在线轮换与"
+                "密文存储卷迁移（不解密、逐字节核对后切换），均可查询进度。",
     lifespan=lifespan,
 )
 
@@ -279,19 +289,26 @@ def _cipher_chunks(path: str):
 
 @app.get("/images/{image_id}", summary="按编号下载原片（流式解密，逐帧验签）")
 async def download_image(image_id: str):
-    meta = db.get_image(image_id)
-    if meta is None:
-        raise HTTPException(404, detail="image not found")
-    if meta["status"] != "ready":
-        raise HTTPException(409, detail=f"image is {meta['status']}")
-    if not os.path.exists(meta["blob_path"]):
-        raise HTTPException(410, detail="encrypted blob missing on storage")
+    # 在途下载登记：必须在读元数据之前 begin。卷迁移切换路径后会等本下载
+    # 结束才删旧文件，因此本次下载全程不受迁移影响（迁移语义见 /migrations）。
+    dl_tracker.begin(image_id)
     try:
-        # 解包一次：明文 DEK 只在本次请求内存；随后即使密钥服务变慢或
-        # 主密钥被销毁，已解包的慢下载也能完整读完（解密不再依赖密钥服务）。
-        dek = await keys.unwrap(meta["master_key_id"], meta["wrapped_dek"])
-    except KeyServiceError as exc:
-        raise _key_error(exc)
+        meta = db.get_image(image_id)
+        if meta is None:
+            raise HTTPException(404, detail="image not found")
+        if meta["status"] != "ready":
+            raise HTTPException(409, detail=f"image is {meta['status']}")
+        if not os.path.exists(meta["blob_path"]):
+            raise HTTPException(410, detail="encrypted blob missing on storage")
+        try:
+            # 解包一次：明文 DEK 只在本次请求内存；随后即使密钥服务变慢或
+            # 主密钥被销毁，已解包的慢下载也能完整读完（解密不再依赖密钥服务）。
+            dek = await keys.unwrap(meta["master_key_id"], meta["wrapped_dek"])
+        except KeyServiceError as exc:
+            raise _key_error(exc)
+    except Exception:
+        dl_tracker.end(image_id)
+        raise
 
     async def plain_iter():
         local_dek = dek  # 局部别名；生成器结束后随帧栈释放，不留长生命周期引用
@@ -303,6 +320,7 @@ async def download_image(image_id: str):
         except IntegrityError as exc:
             raise HTTPException(500, detail=f"integrity check failed: {exc}")
         finally:
+            dl_tracker.end(image_id)
             del local_dek
 
     headers = {"X-Image-Id": image_id,
@@ -377,6 +395,101 @@ def _rotation_view(job: dict) -> dict:
     total = max(job["total"], job["migrated"] + job["failed"], 1)
     pct = round(100.0 * (job["migrated"] + job["failed"]) / total, 2)
     return {**{k: v for k, v in job.items()}, "progress_percent": pct}
+
+
+# --------------------------------------------------------------------------
+# 密文存储卷迁移
+# --------------------------------------------------------------------------
+class MigrationRequest(BaseModel):
+    confirm: bool = True
+    image_ids: list[str] | None = None   # 缺省 = 当前全部 ready 原片
+    target_dir: str | None = None        # 缺省 = MIGRATION_TARGET_DIR（新卷）
+
+
+@app.post("/migrations", status_code=202,
+          summary="把已发布原片密文迁到新存储卷（按编号；核对一致后切换并清理旧卷）")
+async def create_migration(req: MigrationRequest):
+    if not req.confirm:
+        raise HTTPException(400, detail="confirm must be true")
+    target = req.target_dir or MIGRATION_TARGET_DIR
+    if not target:
+        raise HTTPException(
+            400, detail={"code": "no_target_dir",
+                         "message": "target_dir not given and "
+                                    "MIGRATION_TARGET_DIR is not configured"})
+    target = os.path.normpath(target)
+    if not os.path.isabs(target):
+        raise HTTPException(400, detail="target_dir must be an absolute path")
+    if target == os.path.normpath(BLOB_DIR):
+        raise HTTPException(
+            400, detail={"code": "target_is_current",
+                         "message": "target_dir equals the current blob dir"})
+    if req.image_ids is None:
+        ids = db.list_ready_image_ids()
+        if not ids:
+            raise HTTPException(400, detail="no ready images to migrate")
+    else:
+        ids = list(dict.fromkeys(req.image_ids))  # 去重保序
+        if not ids:
+            raise HTTPException(400, detail="image_ids is empty")
+        missing, not_ready = [], []
+        for image_id in ids:
+            meta = db.get_image(image_id)
+            if meta is None:
+                missing.append(image_id)
+            elif meta["status"] != "ready":
+                not_ready.append({"image_id": image_id, "status": meta["status"]})
+        if missing:
+            raise HTTPException(
+                404, detail={"code": "images_not_found", "missing": missing})
+        if not_ready:
+            raise HTTPException(
+                409, detail={"code": "images_not_ready", "images": not_ready})
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            400, detail={"code": "target_not_usable",
+                         "message": f"cannot create target_dir: {exc!r}"})
+    items = [(image_id, os.path.join(target, image_id + ".msef"))
+             for image_id in ids]
+    try:
+        job_id = db.create_migration(target, items)
+    except RuntimeError:
+        active = db.active_migration()
+        raise HTTPException(
+            409, detail={"code": "migration_in_progress",
+                         "job_id": active["job_id"] if active else None})
+    return {"job_id": job_id, "state": "running", "total": len(items),
+            "target_dir": target}
+
+
+@app.get("/migrations/latest", summary="查询最近一次卷迁移进度")
+async def latest_migration():
+    job = db.latest_migration()
+    if job is None:
+        return {"message": "no migration has ever run"}
+    return _migration_view(job)
+
+
+@app.get("/migrations/{job_id}", summary="按作业号查询卷迁移进度")
+async def migration_status(job_id: str):
+    job = db.get_migration(job_id)
+    if job is None:
+        raise HTTPException(404, detail="migration job not found")
+    return _migration_view(job)
+
+
+def _migration_view(job: dict) -> dict:
+    total = max(job["total"], job["migrated"] + job["failed"], 1)
+    pct = round(100.0 * (job["migrated"] + job["failed"]) / total, 2)
+    view = {**job, "progress_percent": pct}
+    failed = db.migration_failed_items(job["job_id"])
+    if failed:
+        view["failed_items"] = [
+            {"image_id": it["image_id"], "error": it["error"]}
+            for it in failed[:20]]
+    return view
 
 
 @app.get("/keys/status", summary="密钥视角状态（代理密钥服务只读接口）")

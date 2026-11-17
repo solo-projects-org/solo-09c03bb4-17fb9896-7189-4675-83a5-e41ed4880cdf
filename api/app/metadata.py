@@ -47,6 +47,33 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
     updated_at      REAL NOT NULL,
     finished_at     REAL
 );
+
+-- 密文存储卷迁移：作业与逐条目状态全部持久化，进程重启后可接续。
+CREATE TABLE IF NOT EXISTS migration_jobs (
+    job_id          TEXT PRIMARY KEY,
+    state           TEXT NOT NULL CHECK (state IN
+                        ('running','completed','failed')),
+    target_dir      TEXT NOT NULL,
+    total           INTEGER NOT NULL DEFAULT 0,
+    migrated        INTEGER NOT NULL DEFAULT 0,
+    failed          INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    started_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    finished_at     REAL
+);
+CREATE TABLE IF NOT EXISTS migration_items (
+    job_id          TEXT NOT NULL,
+    image_id        TEXT NOT NULL,
+    source_path     TEXT,              -- 计划时记录的旧卷路径（清理依据）
+    target_path     TEXT NOT NULL,     -- 新卷目标路径
+    state           TEXT NOT NULL CHECK (state IN
+                        ('pending','copying','copied','switched',
+                         'done','failed')),
+    error           TEXT,
+    updated_at      REAL NOT NULL,
+    PRIMARY KEY (job_id, image_id)
+);
 """
 
 TERMINAL_STATES = ("completed", "failed")
@@ -187,6 +214,26 @@ class MetadataDB:
             self.conn.commit()
             return cur.rowcount
 
+    def list_ready_image_ids(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT image_id FROM images WHERE status='ready' "
+            "ORDER BY created_at").fetchall()
+        return [r["image_id"] for r in rows]
+
+    def update_image_blob_path(self, image_id: str, expect_path: str,
+                               new_path: str) -> bool:
+        """条件更新：仅当元数据仍指向旧路径时切换到新卷路径。
+
+        只改 blob_path 一列——绝不触碰 wrapped_dek/master_key_id，
+        因此与主密钥轮换的条件 rewrap 互不覆盖，迁移不可能把旧信封写回。
+        """
+        with self._write_lock:
+            cur = self.conn.execute(
+                "UPDATE images SET blob_path=? WHERE image_id=? AND blob_path=?",
+                (new_path, image_id, expect_path))
+            self.conn.commit()
+            return cur.rowcount > 0
+
     # ---- 轮换作业 -------------------------------------------------------
     def active_rotation(self) -> dict | None:
         row = self.conn.execute(
@@ -249,6 +296,118 @@ class MetadataDB:
             self.conn.execute(
                 f"UPDATE rotation_jobs SET {', '.join(sets)} WHERE job_id=?",
                 params)
+            self.conn.commit()
+
+    # ---- 卷迁移作业 -------------------------------------------------------
+    def active_migration(self) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM migration_jobs "
+            "WHERE state NOT IN ('completed','failed')").fetchone()
+        return dict(row) if row else None
+
+    def create_migration(self, target_dir: str,
+                         items: list[tuple[str, str]]) -> str:
+        """items 为 (image_id, target_path) 列表；同一时刻只允许一个作业。"""
+        with self._write_lock:
+            if self.active_migration() is not None:
+                raise RuntimeError("migration already in progress")
+            job_id = "mig-" + uuid.uuid4().hex
+            now = time.time()
+            self.conn.execute(
+                "INSERT INTO migration_jobs (job_id, state, target_dir, total, "
+                "migrated, failed, started_at, updated_at) "
+                "VALUES (?, 'running', ?, ?, 0, 0, ?, ?)",
+                (job_id, target_dir, len(items), now, now))
+            self.conn.executemany(
+                "INSERT INTO migration_items (job_id, image_id, source_path, "
+                "target_path, state, updated_at) "
+                "VALUES (?,?,NULL,?,'pending',?)",
+                [(job_id, image_id, target_path, now)
+                 for image_id, target_path in items])
+            self.conn.commit()
+            return job_id
+
+    def get_migration(self, job_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM migration_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_migration(self) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM migration_jobs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def bump_migration(self, job_id: str, migrated: int = 0, failed: int = 0,
+                       state: str | None = None, error: str | None = None) -> None:
+        with self._write_lock:
+            sets = ["updated_at=?"]
+            params: list[Any] = [time.time()]
+            if migrated:
+                sets.append("migrated = migrated + ?")
+                params.append(migrated)
+            if failed:
+                sets.append("failed = failed + ?")
+                params.append(failed)
+            if state:
+                sets.append("state=?")
+                params.append(state)
+            if error is not None:
+                # 空串用于清除上一条错误（如清理重试最终成功）
+                sets.append("error=?")
+                params.append(error[:500] if error else None)
+            if state in TERMINAL_STATES:
+                sets.append("finished_at=?")
+                params.append(time.time())
+                if state == "completed" and error is None:
+                    # 完成即意味着新卷全部可取数且旧件已清除，不残留旧错误
+                    sets.append("error=NULL")
+            params.append(job_id)
+            self.conn.execute(
+                f"UPDATE migration_jobs SET {', '.join(sets)} WHERE job_id=?",
+                params)
+            self.conn.commit()
+
+    # ---- 迁移条目 ---------------------------------------------------------
+    def get_migration_item(self, job_id: str, image_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM migration_items WHERE job_id=? AND image_id=?",
+            (job_id, image_id)).fetchone()
+        return dict(row) if row else None
+
+    def migration_open_items(self, job_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM migration_items WHERE job_id=? "
+            "AND state NOT IN ('done','failed') ORDER BY rowid",
+            (job_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def migration_failed_items(self, job_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM migration_items WHERE job_id=? AND state='failed' "
+            "ORDER BY rowid", (job_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_migration_item(self, job_id: str, image_id: str,
+                           state: str | None = None,
+                           source_path: str | None = None,
+                           error: str | None = None) -> None:
+        with self._write_lock:
+            sets = ["updated_at=?"]
+            params: list[Any] = [time.time()]
+            if state:
+                sets.append("state=?")
+                params.append(state)
+            if source_path is not None:
+                sets.append("source_path=?")
+                params.append(source_path)
+            if error is not None:
+                sets.append("error=?")
+                params.append(error[:500] if error else None)
+            params.extend([job_id, image_id])
+            self.conn.execute(
+                f"UPDATE migration_items SET {', '.join(sets)} "
+                "WHERE job_id=? AND image_id=?", params)
             self.conn.commit()
 
     def close(self):
